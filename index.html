@@ -4,7 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Carrom Mania - Multi-Player</title>
-    <!-- Replaced PeerJS with MQTT WebSockets for 100% reliable connections -->
     <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
     <style>
         :root {
@@ -129,7 +128,7 @@
             <hr style="width:100%; border: 0; border-top: 1px solid #444;">
             
             <div class="slider-group">
-                <label style="font-size: 0.8rem;">Move Striker (Your Turn Only)</label>
+                <label style="font-size: 0.8rem;">Move Striker</label>
                 <input type="range" id="striker-pos" min="160" max="640" value="400">
             </div>
 
@@ -152,7 +151,7 @@ const FRICTION = 0.985;
 const POCKET_RADIUS = 38;
 const PIECE_RAD = 18;
 const STRIKER_RAD = 24;
-const PIECE_COLORS = ['white', 'black', 'blue', 'green']; 
+const PIECE_COLORS =['white', 'black', 'blue', 'green']; 
 
 class Vec {
     constructor(x, y) { this.x = x; this.y = y; }
@@ -261,7 +260,6 @@ let dragEnd = new Vec(0,0);
 let gameStarted = false;
 let shotFired = false;
 let gameOverMsg = "";
-let needsSync = true; 
 
 let queenState = 'board';
 let queenSinker = -1;
@@ -288,7 +286,7 @@ function resetButtons() {
 }
 
 
-/** --- NEW CLOUD NETWORKING (Replaces WebRTC) --- **/
+/** --- CLOUD NETWORKING (MQTT) --- **/
 const MQTT_BROKER = 'wss://broker.emqx.io:8084/mqtt';
 const TOPIC_PREFIX = "BREADMASTER_CARROM_MANIA_101/"; 
 let mqttClient;
@@ -299,23 +297,16 @@ function connectToCloud(onConnected) {
         onConnected();
         return;
     }
-    
     mqttClient = mqtt.connect(MQTT_BROKER);
-    
-    mqttClient.on('connect', () => {
-        onConnected();
-    });
+    mqttClient.on('connect', () => { onConnected(); });
 
     mqttClient.on('message', (topic, message) => {
         try {
             let data = JSON.parse(message.toString());
-            if (data.sender === myIdShort) return; // Don't process our own packets
+            if (data.sender === myIdShort) return; // Ignore own messages
             
-            if (isHost && topic.endsWith('/host')) {
-                handleData(data, data.sender);
-            } else if (!isHost && topic.endsWith('/client')) {
-                handleData(data, data.sender);
-            }
+            if (isHost && topic.endsWith('/host')) handleData(data, data.sender);
+            else if (!isHost && topic.endsWith('/client')) handleData(data, data.sender);
         } catch(e) {}
     });
 
@@ -343,8 +334,7 @@ function hostGame() {
 
     connectToCloud(() => {
         isHost = true;
-        mqttClient.subscribe(`${TOPIC_PREFIX}${roomCode}/host`); // Listen for clients
-        
+        mqttClient.subscribe(`${TOPIC_PREFIX}${roomCode}/host`); 
         players.push({id: myIdShort, name: myName, targetColor: ''});
         
         document.getElementById('lobby-init').style.display = 'none';
@@ -370,8 +360,7 @@ function joinGame() {
         roomCode = target;
         myIdShort = "CLIENT_" + Math.floor(Math.random()*10000);
         
-        mqttClient.subscribe(`${TOPIC_PREFIX}${roomCode}/client`); // Listen for Host
-        
+        mqttClient.subscribe(`${TOPIC_PREFIX}${roomCode}/client`); 
         sendToHost({ type: 'hello', name: myName });
         
         document.getElementById('lobby-init').style.display = 'none';
@@ -379,7 +368,6 @@ function joinGame() {
         document.getElementById('room-code-label').innerText = roomCode;
         setStatus("Connected! Waiting for host to start...");
         
-        // Timeout if room doesn't exist
         connectionTimeout = setTimeout(() => {
             if (players.length === 0) {
                 setStatus("Room not found or Host left.", true);
@@ -414,7 +402,7 @@ function handleData(data, senderId) {
     }
 
     if (data.type === 'lobby-update') {
-        clearTimeout(connectionTimeout); // Host confirmed we are in!
+        clearTimeout(connectionTimeout); 
         players = data.players;
         updateLobbyUI();
     }
@@ -425,24 +413,33 @@ function handleData(data, senderId) {
         startGame();
     }
     
+    // Smooth Slider Sync (Forwarded through Host)
     if (data.type === 'move-striker' && isHost) {
         if (players[turnIndex].id === senderId && !shotFired) {
             striker.pos.x = data.x;
-            needsSync = true;
+            broadcast({ type: 'update-striker-pos', x: data.x });
         }
     }
+    if (data.type === 'update-striker-pos' && !isHost) {
+        striker.pos.x = data.x;
+        strikerSlider.value = data.x;
+    }
     
+    // Physics Synced Firing
     if (data.type === 'shot' && isHost) {
         if (players[turnIndex].id === senderId && !shotFired) {
             striker.vel = new Vec(data.vel.x, data.vel.y);
             shotFired = true;
-            needsSync = true;
+            broadcast({ type: 'apply-shot', vel: data.vel });
         }
     }
+    if (data.type === 'apply-shot' && !isHost) {
+        striker.vel = new Vec(data.vel.x, data.vel.y);
+        shotFired = true;
+    }
     
+    // Host Referee Corrects Final Positions
     if (data.type === 'sync-state' && !isHost) {
-        let turnChanged = (turnIndex !== data.turnIndex);
-        
         turnIndex = data.turnIndex;
         players = data.players;
         shotFired = data.shotFired;
@@ -457,17 +454,12 @@ function handleData(data, senderId) {
             pieces[i].type = p.type;
         });
 
-        const isMyTurn = players[turnIndex].id === myIdShort;
-        
-        if (!isMyTurn || shotFired || turnChanged) {
-            striker.pos.x = data.striker.x;
-            strikerSlider.value = data.striker.x;
-        }
-        
+        striker.pos.x = data.striker.x;
         striker.pos.y = data.striker.y;
         striker.vel = new Vec(data.striker.vx, data.striker.vy);
         striker.removed = data.striker.removed;
         striker.scale = data.striker.scale;
+        strikerSlider.value = data.striker.x;
     }
     
     if (data.type === 'game-over') {
@@ -513,7 +505,7 @@ function initBoard() {
         for(let i=0; i<players.length; i++) sequence.push(players[i].targetColor);
     }
     
-    let ringSizes = [6, 12, 18, 24, 30];
+    let ringSizes =[6, 12, 18, 24, 30];
     let rIdx = 0, pIdx = 0, radius = 38;
     
     while(pIdx < sequence.length) {
@@ -566,6 +558,7 @@ function checkPockets() {
         holes.forEach(h => {
             if (p.pos.dist(h) < POCKET_RADIUS) {
                 p.isSinking = true;
+                // Host referee logic
                 if (isHost) {
                     if (p.type === 'striker') currentShotStats.foul = true;
                     else if (p.type === 'queen') currentShotStats.queenSunk = true;
@@ -635,38 +628,30 @@ function evaluateShotRules() {
     turnIndex = nextTurn;
     resetStriker();
     shotFired = false;
-    needsSync = true;
 }
 
 function gameLoop() {
     ctx.clearRect(0, 0, BOARD_SIZE, BOARD_SIZE);
     
-    if (isHost && !gameOverMsg) {
+    // Everyone runs physics natively locally!
+    if (!gameOverMsg) {
         resolveCollisions();
         checkPockets();
     }
     
     [striker, ...pieces].forEach(p => p.update());
 
-    let moving =[striker, ...pieces].some(p => p.vel.mag() > 0.1 || (p.isSinking && !p.removed));
+    let moving = [striker, ...pieces].some(p => p.vel.mag() > 0.1 || (p.isSinking && !p.removed));
     
-    if (moving || shotFired) {
-        needsSync = true; 
-    }
-    
+    // When everything finishes moving, Host tallies score and syncs final positions
     if (isHost && shotFired && !moving && !gameOverMsg) {
-        evaluateShotRules();
-    }
-
-    if (isHost && needsSync) {
+        evaluateShotRules(); // Resolves turn
+        
         broadcast({
             type: 'sync-state', turnIndex, shotFired, players, queenState,
-            striker: {x: striker.pos.x, y: striker.pos.y, vx: striker.vel.x, vy: striker.vel.y, removed: striker.removed, scale: striker.scale},
+            striker: {x: striker.pos.x, y: striker.pos.y, vx: 0, vy: 0, removed: striker.removed, scale: striker.scale},
             pieces: pieces.map(p => ({x: p.pos.x, y: p.pos.y, removed: p.removed, isSinking: p.isSinking, scale: p.scale, type: p.type}))
         });
-        if (!moving && !shotFired) {
-            needsSync = false; 
-        }
     }
 
     drawBoard();
@@ -771,7 +756,7 @@ strikerSlider.addEventListener('input', e => {
     striker.pos.x = x; 
     
     if (isHost) {
-        needsSync = true;
+        broadcast({ type: 'update-striker-pos', x: x });
     } else {
         sendToHost({ type: 'move-striker', x: x });
     }
@@ -799,10 +784,11 @@ window.addEventListener('mouseup', e => {
     
     if (vel.mag() > 40) vel = vel.normalize().mult(40);
 
+    // Apply exact velocity across everyone instantly
     if (isHost) {
         striker.vel = vel;
         shotFired = true;
-        needsSync = true;
+        broadcast({ type: 'apply-shot', vel: {x: vel.x, y: vel.y} });
     } else {
         sendToHost({ type: 'shot', vel: {x: vel.x, y: vel.y} });
     }
