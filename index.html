@@ -4,7 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Carrom Mania - Multi-Player</title>
-    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <!-- Replaced PeerJS with MQTT WebSockets for 100% reliable connections -->
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
     <style>
         :root {
             --bg: #1a1a1a;
@@ -145,26 +146,13 @@
 
 <script>
 /** --- CONSTANTS & MATH --- **/
-const ID_PREFIX = "CARROM-MANIA-V1-"; 
 const BOARD_SIZE = 800;
 const PADDING = 45;
 const FRICTION = 0.985;
 const POCKET_RADIUS = 38;
 const PIECE_RAD = 18;
 const STRIKER_RAD = 24;
-
 const PIECE_COLORS = ['white', 'black', 'blue', 'green']; 
-
-// Expanded, highly reliable STUN servers for NAT Traversal
-const peerConfig = {
-    config: {
-        iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'stun:stun.cloudflare.com:3478' }
-        ]
-    }
-};
 
 class Vec {
     constructor(x, y) { this.x = x; this.y = y; }
@@ -262,12 +250,10 @@ const canvas = document.getElementById('gameBoard');
 const ctx = canvas.getContext('2d');
 const strikerSlider = document.getElementById('striker-pos');
 
-let peer, myIdShort, myName;
-let connections = []; 
-let hostConn; 
+let myIdShort, myName, roomCode;
 let isHost = false;
 let players = []; 
-let pieces = [];
+let pieces =[];
 let striker;
 let turnIndex = 0;
 let isDragging = false;
@@ -301,49 +287,72 @@ function resetButtons() {
     document.getElementById('btn-join').innerText = "Join Game";
 }
 
-/** --- NETWORKING --- **/
-function handlePeerErrors(p) {
-    p.on('error', err => {
-        console.error(err);
-        setStatus("Network Error. Try again.", true);
+
+/** --- NEW CLOUD NETWORKING (Replaces WebRTC) --- **/
+const MQTT_BROKER = 'wss://broker.emqx.io:8084/mqtt';
+const TOPIC_PREFIX = "BREADMASTER_CARROM_MANIA_101/"; 
+let mqttClient;
+let connectionTimeout;
+
+function connectToCloud(onConnected) {
+    if (mqttClient && mqttClient.connected) {
+        onConnected();
+        return;
+    }
+    
+    mqttClient = mqtt.connect(MQTT_BROKER);
+    
+    mqttClient.on('connect', () => {
+        onConnected();
+    });
+
+    mqttClient.on('message', (topic, message) => {
+        try {
+            let data = JSON.parse(message.toString());
+            if (data.sender === myIdShort) return; // Don't process our own packets
+            
+            if (isHost && topic.endsWith('/host')) {
+                handleData(data, data.sender);
+            } else if (!isHost && topic.endsWith('/client')) {
+                handleData(data, data.sender);
+            }
+        } catch(e) {}
+    });
+
+    mqttClient.on('error', (err) => {
+        setStatus("Cloud Server Error. Try again.", true);
         resetButtons();
+    });
+    
+    mqttClient.on('close', () => {
+        if (gameStarted) {
+            alert("Connection to cloud lost!");
+            location.reload();
+        }
     });
 }
 
 function hostGame() {
     myName = document.getElementById('player-name').value.trim() || "Host";
-    myIdShort = generateShortID();
+    roomCode = generateShortID();
+    myIdShort = "HOST_" + Math.floor(Math.random()*10000);
     
     document.getElementById('btn-host').disabled = true;
     document.getElementById('btn-host').innerText = "Creating Room...";
     setStatus("Connecting to Server...");
 
-    peer = new Peer(ID_PREFIX + myIdShort, peerConfig);
-    handlePeerErrors(peer);
-
-    peer.on('open', id => {
+    connectToCloud(() => {
         isHost = true;
-        players.push({id: peer.id, name: myName, targetColor: ''});
+        mqttClient.subscribe(`${TOPIC_PREFIX}${roomCode}/host`); // Listen for clients
+        
+        players.push({id: myIdShort, name: myName, targetColor: ''});
         
         document.getElementById('lobby-init').style.display = 'none';
         document.getElementById('lobby-wait').style.display = 'block';
-        document.getElementById('room-code-label').innerText = myIdShort;
+        document.getElementById('room-code-label').innerText = roomCode;
         document.getElementById('start-btn').style.display = 'inline-block';
         updateLobbyUI();
-    });
-
-    peer.on('connection', conn => {
-        if (!isHost || gameStarted) { conn.close(); return; }
-        connections.push(conn);
-        
-        conn.on('data', data => {
-            if (data.type === 'hello') {
-                players.push({id: conn.peer, name: data.name || "Player", targetColor: ''});
-                broadcast({ type: 'lobby-update', players: players });
-                updateLobbyUI();
-            }
-            handleData(data, conn);
-        });
+        setStatus("Room live! Waiting for players...");
     });
 }
 
@@ -356,46 +365,56 @@ function joinGame() {
     document.getElementById('btn-join').innerText = "Finding Room...";
     setStatus("Connecting to Server...");
 
-    peer = new Peer(peerConfig); 
-    handlePeerErrors(peer);
-    
-    let connectionTimeout;
-
-    peer.on('open', () => {
+    connectToCloud(() => {
         isHost = false;
-        setStatus("Searching for Room " + target + "...");
+        roomCode = target;
+        myIdShort = "CLIENT_" + Math.floor(Math.random()*10000);
         
-        // Use reliable: true to prevent game state packet loss
-        hostConn = peer.connect(ID_PREFIX + target, { reliable: true });
+        mqttClient.subscribe(`${TOPIC_PREFIX}${roomCode}/client`); // Listen for Host
         
-        // 10 Second timeout failsafe
+        sendToHost({ type: 'hello', name: myName });
+        
+        document.getElementById('lobby-init').style.display = 'none';
+        document.getElementById('lobby-wait').style.display = 'block';
+        document.getElementById('room-code-label').innerText = roomCode;
+        setStatus("Connected! Waiting for host to start...");
+        
+        // Timeout if room doesn't exist
         connectionTimeout = setTimeout(() => {
-            setStatus("Failed to connect. Room may not exist.", true);
-            resetButtons();
-            peer.destroy();
-        }, 10000);
-
-        hostConn.on('open', () => {
-            clearTimeout(connectionTimeout); // We connected! Cancel timeout.
-            setStatus("Connected!");
-            hostConn.send({ type: 'hello', name: myName });
-            
-            document.getElementById('lobby-init').style.display = 'none';
-            document.getElementById('lobby-wait').style.display = 'block';
-            document.getElementById('room-code-label').innerText = target;
-        });
-
-        hostConn.on('data', data => handleData(data, hostConn));
-        
-        hostConn.on('close', () => {
-            alert("Connection to host lost!");
-            location.reload();
-        });
+            if (players.length === 0) {
+                setStatus("Room not found or Host left.", true);
+                resetButtons();
+                document.getElementById('lobby-init').style.display = 'block';
+                document.getElementById('lobby-wait').style.display = 'none';
+                mqttClient.end();
+            }
+        }, 5000);
     });
 }
 
-function handleData(data, sender) {
+function broadcast(data) {
+    if (mqttClient && mqttClient.connected) {
+        data.sender = myIdShort;
+        mqttClient.publish(`${TOPIC_PREFIX}${roomCode}/client`, JSON.stringify(data), {qos: 0});
+    }
+}
+
+function sendToHost(data) {
+    if (mqttClient && mqttClient.connected) {
+        data.sender = myIdShort;
+        mqttClient.publish(`${TOPIC_PREFIX}${roomCode}/host`, JSON.stringify(data), {qos: 0});
+    }
+}
+
+function handleData(data, senderId) {
+    if (data.type === 'hello' && isHost) {
+        players.push({id: senderId, name: data.name || "Player", targetColor: ''});
+        broadcast({ type: 'lobby-update', players: players });
+        updateLobbyUI();
+    }
+
     if (data.type === 'lobby-update') {
+        clearTimeout(connectionTimeout); // Host confirmed we are in!
         players = data.players;
         updateLobbyUI();
     }
@@ -407,14 +426,14 @@ function handleData(data, sender) {
     }
     
     if (data.type === 'move-striker' && isHost) {
-        if (players[turnIndex].id === sender.peer && !shotFired) {
+        if (players[turnIndex].id === senderId && !shotFired) {
             striker.pos.x = data.x;
             needsSync = true;
         }
     }
     
     if (data.type === 'shot' && isHost) {
-        if (players[turnIndex].id === sender.peer && !shotFired) {
+        if (players[turnIndex].id === senderId && !shotFired) {
             striker.vel = new Vec(data.vel.x, data.vel.y);
             shotFired = true;
             needsSync = true;
@@ -438,7 +457,7 @@ function handleData(data, sender) {
             pieces[i].type = p.type;
         });
 
-        const isMyTurn = players[turnIndex].id === peer.id;
+        const isMyTurn = players[turnIndex].id === myIdShort;
         
         if (!isMyTurn || shotFired || turnChanged) {
             striker.pos.x = data.striker.x;
@@ -456,18 +475,14 @@ function handleData(data, sender) {
     }
 }
 
-function broadcast(data) {
-    connections.forEach(c => {
-        if(c.open) c.send(data);
-    });
-}
 
+/** --- LOBBY AND GAME SETUP --- **/
 function updateLobbyUI() {
     const list = document.getElementById('p-list-items');
     list.innerHTML = "";
     players.forEach(p => {
         const li = document.createElement('li');
-        li.innerText = p.name + (p.id === peer.id ? " (You)" : "");
+        li.innerText = p.name + (p.id === myIdShort ? " (You)" : "");
         list.appendChild(li);
     });
 }
@@ -488,13 +503,12 @@ function startGame() {
     gameLoop();
 }
 
-/** --- BOARD SETUP --- **/
 function initBoard() {
-    pieces = [];
+    pieces =[];
     const cx = 400, cy = 400;
     pieces.push(new Piece(cx, cy, PIECE_RAD, 'queen'));
     
-    let sequence = [];
+    let sequence =[];
     for(let j=0; j<9; j++) {
         for(let i=0; i<players.length; i++) sequence.push(players[i].targetColor);
     }
@@ -542,7 +556,7 @@ function resolveCollisions() {
 }
 
 function checkPockets() {
-    const holes = [
+    const holes =[
         new Vec(PADDING, PADDING), new Vec(BOARD_SIZE-PADDING, PADDING),
         new Vec(PADDING, BOARD_SIZE-PADDING), new Vec(BOARD_SIZE-PADDING, BOARD_SIZE-PADDING)
     ];
@@ -634,7 +648,7 @@ function gameLoop() {
     
     [striker, ...pieces].forEach(p => p.update());
 
-    let moving = [striker, ...pieces].some(p => p.vel.mag() > 0.1 || (p.isSinking && !p.removed));
+    let moving =[striker, ...pieces].some(p => p.vel.mag() > 0.1 || (p.isSinking && !p.removed));
     
     if (moving || shotFired) {
         needsSync = true; 
@@ -729,7 +743,7 @@ function updateUI() {
         container.appendChild(row);
     });
 
-    const isMyTurn = players[turnIndex].id === peer.id;
+    const isMyTurn = players[turnIndex].id === myIdShort;
     strikerSlider.disabled = (!isMyTurn || shotFired);
     
     const status = document.getElementById('turn-status');
@@ -750,8 +764,8 @@ function updateUI() {
 
 /** --- INPUTS --- **/
 strikerSlider.addEventListener('input', e => {
-    if (!peer || players.length === 0 || gameOverMsg) return;
-    if (players[turnIndex].id !== peer.id || shotFired) return;
+    if (!mqttClient || players.length === 0 || gameOverMsg) return;
+    if (players[turnIndex].id !== myIdShort || shotFired) return;
     
     let x = parseInt(e.target.value);
     striker.pos.x = x; 
@@ -759,13 +773,13 @@ strikerSlider.addEventListener('input', e => {
     if (isHost) {
         needsSync = true;
     } else {
-        if(hostConn && hostConn.open) hostConn.send({ type: 'move-striker', x: x });
+        sendToHost({ type: 'move-striker', x: x });
     }
 });
 
 canvas.addEventListener('mousedown', e => {
-    if (!peer || players.length === 0 || gameOverMsg) return;
-    if (players[turnIndex].id !== peer.id || shotFired || striker.vel.mag() > 0.1) return;
+    if (!mqttClient || players.length === 0 || gameOverMsg) return;
+    if (players[turnIndex].id !== myIdShort || shotFired || striker.vel.mag() > 0.1) return;
     isDragging = true;
 });
 
@@ -790,7 +804,7 @@ window.addEventListener('mouseup', e => {
         shotFired = true;
         needsSync = true;
     } else {
-        if(hostConn && hostConn.open) hostConn.send({ type: 'shot', vel: {x: vel.x, y: vel.y} });
+        sendToHost({ type: 'shot', vel: {x: vel.x, y: vel.y} });
     }
 });
 
