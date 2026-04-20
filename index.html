@@ -39,8 +39,12 @@
             background: var(--accent); color: white; cursor: pointer; 
             font-weight: bold; transition: 0.2s; margin-top: 5px;
         }
-        button:hover { background: #d35400; transform: translateY(-2px); }
-        button:disabled { background: #555; cursor: not-allowed; opacity: 0.5; }
+        button:hover:not(:disabled) { background: #d35400; transform: translateY(-2px); }
+        button:disabled { background: #555; cursor: not-allowed; opacity: 0.7; }
+
+        #status-msg {
+            margin-top: 10px; font-size: 0.9rem; color: #f1c40f; font-weight: bold; height: 20px;
+        }
 
         #player-list {
             margin: 15px 0; padding: 10px; background: rgba(0,0,0,0.2);
@@ -92,13 +96,15 @@
         
         <div id="lobby-init">
             <input type="text" id="player-name" placeholder="ENTER YOUR NAME" maxlength="15">
-            <button onclick="hostGame()">Host New Game</button>
+            <button id="btn-host" onclick="hostGame()">Host New Game</button>
             
             <hr style="border:0; border-top:1px solid #444; margin: 25px 0;">
             
             <p style="margin: 0 0 10px 0; color: #aaa; font-size: 0.9rem;">OR JOIN FRIEND</p>
             <input type="text" id="join-id" placeholder="ROOM CODE (3 CHARS)" maxlength="3">
-            <button onclick="joinGame()" style="background: #2980b9;">Join Game</button>
+            <button id="btn-join" onclick="joinGame()" style="background: #2980b9;">Join Game</button>
+            
+            <div id="status-msg"></div>
         </div>
         
         <div id="lobby-wait" style="display:none;">
@@ -139,7 +145,7 @@
 
 <script>
 /** --- CONSTANTS & MATH --- **/
-const ID_PREFIX = "CMANIA-"; // Unique prefix
+const ID_PREFIX = "CARROM-MANIA-V1-"; 
 const BOARD_SIZE = 800;
 const PADDING = 45;
 const FRICTION = 0.985;
@@ -149,13 +155,13 @@ const STRIKER_RAD = 24;
 
 const PIECE_COLORS = ['white', 'black', 'blue', 'green']; 
 
-// ICE Servers to bypass firewalls and let players on different networks join
+// Expanded, highly reliable STUN servers for NAT Traversal
 const peerConfig = {
     config: {
         iceServers: [
             { urls: 'stun:stun.l.google.com:19302' },
             { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'stun:global.stun.twilio.com:3478' }
+            { urls: 'stun:stun.cloudflare.com:3478' }
         ]
     }
 };
@@ -193,7 +199,7 @@ class Piece {
     draw(ctx) {
         if (this.removed) return;
         const c = this.colors[this.type];
-        if(!c) return; // Failsafe against desyncs
+        if(!c) return; 
 
         ctx.save();
         ctx.translate(this.pos.x, this.pos.y);
@@ -269,9 +275,8 @@ let dragEnd = new Vec(0,0);
 let gameStarted = false;
 let shotFired = false;
 let gameOverMsg = "";
-let needsSync = true; // Prevents network flooding
+let needsSync = true; 
 
-// Game Rules State
 let queenState = 'board';
 let queenSinker = -1;
 let currentShotStats = { foul: false, ownPieceSunk: false, queenSunk: false };
@@ -283,13 +288,25 @@ function generateShortID() {
     return result;
 }
 
+function setStatus(msg, isError = false) {
+    const el = document.getElementById('status-msg');
+    el.innerText = msg;
+    el.style.color = isError ? '#e74c3c' : '#f1c40f';
+}
+
+function resetButtons() {
+    document.getElementById('btn-host').disabled = false;
+    document.getElementById('btn-host').innerText = "Host New Game";
+    document.getElementById('btn-join').disabled = false;
+    document.getElementById('btn-join').innerText = "Join Game";
+}
+
 /** --- NETWORKING --- **/
 function handlePeerErrors(p) {
     p.on('error', err => {
         console.error(err);
-        alert("Network Error: " + err.message + "\n\nMake sure the room code is correct.");
-        document.getElementById('lobby-wait').style.display = 'none';
-        document.getElementById('lobby-init').style.display = 'block';
+        setStatus("Network Error. Try again.", true);
+        resetButtons();
     });
 }
 
@@ -297,6 +314,10 @@ function hostGame() {
     myName = document.getElementById('player-name').value.trim() || "Host";
     myIdShort = generateShortID();
     
+    document.getElementById('btn-host').disabled = true;
+    document.getElementById('btn-host').innerText = "Creating Room...";
+    setStatus("Connecting to Server...");
+
     peer = new Peer(ID_PREFIX + myIdShort, peerConfig);
     handlePeerErrors(peer);
 
@@ -329,23 +350,47 @@ function hostGame() {
 function joinGame() {
     myName = document.getElementById('player-name').value.trim() || "Player";
     const target = document.getElementById('join-id').value.toUpperCase();
-    if (target.length !== 3) return alert("Enter exactly 3 characters for Room Code!");
+    if (target.length !== 3) return setStatus("Enter exactly 3 characters!", true);
     
+    document.getElementById('btn-join').disabled = true;
+    document.getElementById('btn-join').innerText = "Finding Room...";
+    setStatus("Connecting to Server...");
+
     peer = new Peer(peerConfig); 
     handlePeerErrors(peer);
     
+    let connectionTimeout;
+
     peer.on('open', () => {
         isHost = false;
-        hostConn = peer.connect(ID_PREFIX + target);
+        setStatus("Searching for Room " + target + "...");
         
+        // Use reliable: true to prevent game state packet loss
+        hostConn = peer.connect(ID_PREFIX + target, { reliable: true });
+        
+        // 10 Second timeout failsafe
+        connectionTimeout = setTimeout(() => {
+            setStatus("Failed to connect. Room may not exist.", true);
+            resetButtons();
+            peer.destroy();
+        }, 10000);
+
         hostConn.on('open', () => {
+            clearTimeout(connectionTimeout); // We connected! Cancel timeout.
+            setStatus("Connected!");
             hostConn.send({ type: 'hello', name: myName });
+            
             document.getElementById('lobby-init').style.display = 'none';
             document.getElementById('lobby-wait').style.display = 'block';
             document.getElementById('room-code-label').innerText = target;
         });
 
         hostConn.on('data', data => handleData(data, hostConn));
+        
+        hostConn.on('close', () => {
+            alert("Connection to host lost!");
+            location.reload();
+        });
     });
 }
 
@@ -412,7 +457,9 @@ function handleData(data, sender) {
 }
 
 function broadcast(data) {
-    connections.forEach(c => c.send(data));
+    connections.forEach(c => {
+        if(c.open) c.send(data);
+    });
 }
 
 function updateLobbyUI() {
@@ -597,7 +644,6 @@ function gameLoop() {
         evaluateShotRules();
     }
 
-    // Network Optimization: Only broadcast if something changed or is moving
     if (isHost && needsSync) {
         broadcast({
             type: 'sync-state', turnIndex, shotFired, players, queenState,
@@ -605,7 +651,7 @@ function gameLoop() {
             pieces: pieces.map(p => ({x: p.pos.x, y: p.pos.y, removed: p.removed, isSinking: p.isSinking, scale: p.scale, type: p.type}))
         });
         if (!moving && !shotFired) {
-            needsSync = false; // Stopped moving, stop flooding the network!
+            needsSync = false; 
         }
     }
 
@@ -713,7 +759,7 @@ strikerSlider.addEventListener('input', e => {
     if (isHost) {
         needsSync = true;
     } else {
-        hostConn.send({ type: 'move-striker', x: x });
+        if(hostConn && hostConn.open) hostConn.send({ type: 'move-striker', x: x });
     }
 });
 
@@ -744,7 +790,7 @@ window.addEventListener('mouseup', e => {
         shotFired = true;
         needsSync = true;
     } else {
-        hostConn.send({ type: 'shot', vel: {x: vel.x, y: vel.y} });
+        if(hostConn && hostConn.open) hostConn.send({ type: 'shot', vel: {x: vel.x, y: vel.y} });
     }
 });
 
