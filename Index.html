@@ -1,0 +1,714 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pro P2P Carrom - Multi-Player</title>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        :root {
+            --bg: #1a1a1a;
+            --panel: #2d2d2d;
+            --accent: #e67e22;
+            --text: #ecf0f1;
+        }
+        body { 
+            background: var(--bg); color: var(--text); 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            display: flex; justify-content: center; align-items: center; 
+            height: 100vh; margin: 0; overflow: hidden; 
+        }
+
+        /* Lobby UI */
+        #lobby {
+            text-align: center; background: var(--panel);
+            padding: 30px; border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5); min-width: 320px;
+        }
+        input[type="text"] { 
+            padding: 12px; border-radius: 6px; border: none; margin: 10px 0; 
+            background: #444; color: white; width: calc(100% - 24px); 
+            text-transform: uppercase; text-align: center; 
+            font-weight: bold; letter-spacing: 2px;
+        }
+        input::placeholder { color: #bbb; font-weight: normal; letter-spacing: normal; }
+        
+        button { 
+            width: 100%; padding: 12px; border-radius: 6px; border: none; 
+            background: var(--accent); color: white; cursor: pointer; 
+            font-weight: bold; transition: 0.2s; margin-top: 5px;
+        }
+        button:hover { background: #d35400; transform: translateY(-2px); }
+        button:disabled { background: #555; cursor: not-allowed; opacity: 0.5; }
+
+        #player-list {
+            margin: 15px 0; padding: 10px; background: rgba(0,0,0,0.2);
+            border-radius: 8px; text-align: left;
+        }
+
+        /* Game Layout */
+        #game-wrapper { display: none; flex-direction: row; gap: 20px; align-items: flex-start; }
+        
+        .sidebar {
+            background: var(--panel); padding: 20px; border-radius: 12px;
+            width: 240px; display: flex; flex-direction: column; gap: 10px;
+            max-height: 80vh; overflow-y: auto;
+        }
+
+        canvas { 
+            background: #e3c18d; border: 15px solid #3d2b1f; 
+            border-radius: 15px; box-shadow: 0 20px 50px rgba(0,0,0,0.8);
+            cursor: crosshair;
+        }
+
+        .score-row {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 8px 12px; background: rgba(0,0,0,0.3);
+            border-radius: 6px; font-size: 0.9rem; margin-bottom: 5px;
+        }
+        .score-row.active { border-left: 4px solid var(--accent); background: #3d3d3d; }
+
+        #turn-status, #queen-status {
+            text-align: center; padding: 8px; border-radius: 4px;
+            text-transform: uppercase; font-weight: bold; font-size: 0.8rem;
+        }
+        #queen-status { background: rgba(0,0,0,0.3); border: 1px solid #e74c3c; margin-bottom: 10px; }
+
+        .slider-group { display: flex; flex-direction: column; gap: 5px; margin-top: 10px; }
+        input[type=range] { width: 100%; margin: 0; padding: 0; cursor: pointer; }
+        
+        .swatch {
+            width: 14px; height: 14px; border-radius: 50%; 
+            display: inline-block; border: 2px solid #fff; margin-right: 8px;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- LOBBY -->
+    <div id="lobby">
+        <h1>CARROM P2P</h1>
+        
+        <div id="lobby-init">
+            <input type="text" id="player-name" placeholder="ENTER YOUR NAME" maxlength="15">
+            <button onclick="hostGame()">Host New Game</button>
+            
+            <hr style="border:0; border-top:1px solid #444; margin: 25px 0;">
+            
+            <p style="margin: 0 0 10px 0; color: #aaa; font-size: 0.9rem;">OR JOIN FRIEND</p>
+            <input type="text" id="join-id" placeholder="ROOM CODE (3 CHARS)" maxlength="3">
+            <button onclick="joinGame()" style="background: #2980b9;">Join Game</button>
+        </div>
+        
+        <div id="lobby-wait" style="display:none;">
+            <h3>Room Code: <span id="room-code-label" style="color: var(--accent); font-size: 1.5rem;"></span></h3>
+            <div id="player-list">
+                <div>Players connected:</div>
+                <ul id="p-list-items"></ul>
+            </div>
+            <button id="start-btn" onclick="hostStartGame()" style="display:none;">Start Game</button>
+            <p id="wait-msg" style="font-size:0.8rem; color:#888;">Waiting for host to start...</p>
+        </div>
+    </div>
+
+    <!-- GAME UI -->
+    <div id="game-wrapper">
+        <div class="sidebar">
+            <div id="turn-status">Game Start</div>
+            <div id="queen-status">Queen: On Board</div>
+            <div id="scoreboard-container"></div>
+            
+            <hr style="width:100%; border: 0; border-top: 1px solid #444;">
+            
+            <div class="slider-group">
+                <label style="font-size: 0.8rem;">Move Striker (Your Turn Only)</label>
+                <input type="range" id="striker-pos" min="160" max="640" value="400">
+            </div>
+
+            <div class="slider-group">
+                <label style="font-size: 0.8rem;">Power Multiplier</label>
+                <input type="range" id="power-sens" min="1" max="8" step="0.1" value="4">
+            </div>
+        </div>
+
+        <div class="canvas-container">
+            <canvas id="gameBoard" width="800" height="800"></canvas>
+        </div>
+    </div>
+
+<script>
+/** --- CONSTANTS & MATH --- **/
+const ID_PREFIX = "CARROM4-";
+const BOARD_SIZE = 800;
+const PADDING = 45;
+const FRICTION = 0.985;
+const POCKET_RADIUS = 38;
+const PIECE_RAD = 18;
+const STRIKER_RAD = 24;
+
+const PIECE_COLORS = ['white', 'black', 'blue', 'green']; 
+
+class Vec {
+    constructor(x, y) { this.x = x; this.y = y; }
+    add(v) { return new Vec(this.x + v.x, this.y + v.y); }
+    sub(v) { return new Vec(this.x - v.x, this.y - v.y); }
+    mult(n) { return new Vec(this.x * n, this.y * n); }
+    mag() { return Math.sqrt(this.x*this.x + this.y*this.y); }
+    dist(v) { return Math.sqrt((this.x-v.x)**2 + (this.y-v.y)**2); }
+    normalize() { let m = this.mag(); return m === 0 ? new Vec(0,0) : this.mult(1/m); }
+}
+
+class Piece {
+    constructor(x, y, radius, type) {
+        this.pos = new Vec(x, y);
+        this.vel = new Vec(0, 0);
+        this.radius = radius;
+        this.type = type;
+        this.scale = 1.0;
+        this.isSinking = false;
+        this.removed = false;
+        
+        this.colors = {
+            white:  { main: '#f9f1d7', detail: '#d4c4a8' },
+            black:  { main: '#2c3e50', detail: '#1a252f' },
+            blue:   { main: '#3498db', detail: '#2980b9' },
+            green:  { main: '#2ecc71', detail: '#27ae60' },
+            queen:  { main: '#e74c3c', detail: '#c0392b' },
+            striker:{ main: '#f39c12', detail: '#d35400' }
+        };
+    }
+
+    draw(ctx) {
+        if (this.removed) return;
+        const c = this.colors[this.type];
+        ctx.save();
+        ctx.translate(this.pos.x, this.pos.y);
+        ctx.scale(this.scale, this.scale);
+        
+        // Shadow
+        ctx.beginPath();
+        ctx.arc(3, 3, this.radius, 0, Math.PI*2);
+        ctx.fillStyle = "rgba(0,0,0,0.3)";
+        ctx.fill();
+        
+        // Body
+        let grad = ctx.createRadialGradient(-this.radius/3, -this.radius/3, 2, 0, 0, this.radius);
+        grad.addColorStop(0, c.main); grad.addColorStop(1, c.detail);
+        
+        ctx.beginPath();
+        ctx.arc(0, 0, this.radius, 0, Math.PI*2);
+        ctx.fillStyle = grad; ctx.fill();
+        ctx.strokeStyle = "rgba(0,0,0,0.5)"; ctx.lineWidth = 2; ctx.stroke();
+        
+        // Center ring design
+        if(this.type !== 'striker') {
+            ctx.beginPath();
+            ctx.arc(0, 0, this.radius * 0.5, 0, Math.PI*2);
+            ctx.strokeStyle = "rgba(0,0,0,0.2)"; ctx.lineWidth = 1.5; ctx.stroke();
+        } else {
+            ctx.beginPath();
+            ctx.arc(0, 0, this.radius * 0.6, 0, Math.PI*2);
+            ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+        }
+
+        ctx.restore();
+    }
+
+    update() {
+        if (this.removed) return;
+        if (this.isSinking) {
+            this.scale -= 0.05;
+            this.vel = this.vel.mult(0.5);
+            if (this.scale <= 0) {
+                this.removed = true;
+                this.scale = 0;
+            }
+            return;
+        }
+        this.pos = this.pos.add(this.vel);
+        this.vel = this.vel.mult(FRICTION);
+        if (this.vel.mag() < 0.15) this.vel = new Vec(0, 0);
+
+        const bounce = 0.7;
+        const limitMin = PADDING + this.radius;
+        const limitMax = BOARD_SIZE - PADDING - this.radius;
+
+        if (this.pos.x < limitMin) { this.pos.x = limitMin; this.vel.x *= -bounce; }
+        if (this.pos.x > limitMax) { this.pos.x = limitMax; this.vel.x *= -bounce; }
+        if (this.pos.y < limitMin) { this.pos.y = limitMin; this.vel.y *= -bounce; }
+        if (this.pos.y > limitMax) { this.pos.y = limitMax; this.vel.y *= -bounce; }
+    }
+}
+
+/** --- STATE MANAGEMENT --- **/
+const canvas = document.getElementById('gameBoard');
+const ctx = canvas.getContext('2d');
+const strikerSlider = document.getElementById('striker-pos');
+
+let peer, myIdShort, myName;
+let connections = []; 
+let hostConn; 
+let isHost = false;
+let players = []; 
+let pieces = [];
+let striker;
+let turnIndex = 0;
+let isDragging = false;
+let dragEnd = new Vec(0,0);
+let gameStarted = false;
+let shotFired = false;
+let gameOverMsg = "";
+
+// Game Rules State
+let queenState = 'board'; // 'board', 'uncovered', 'covered'
+let queenSinker = -1;
+let currentShotStats = { foul: false, ownPieceSunk: false, queenSunk: false };
+
+function generateShortID() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let result = '';
+    for (let i = 0; i < 3; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
+    return result;
+}
+
+/** --- NETWORKING --- **/
+function hostGame() {
+    myName = document.getElementById('player-name').value.trim() || "Host";
+    myIdShort = generateShortID();
+    peer = new Peer(ID_PREFIX + myIdShort);
+
+    peer.on('open', id => {
+        isHost = true;
+        players.push({id: peer.id, name: myName, targetColor: ''});
+        
+        document.getElementById('lobby-init').style.display = 'none';
+        document.getElementById('lobby-wait').style.display = 'block';
+        document.getElementById('room-code-label').innerText = myIdShort;
+        document.getElementById('start-btn').style.display = 'inline-block';
+        updateLobbyUI();
+    });
+
+    peer.on('connection', conn => {
+        if (!isHost || gameStarted) { conn.close(); return; }
+        connections.push(conn);
+        
+        conn.on('data', data => {
+            if (data.type === 'hello') {
+                players.push({id: conn.peer, name: data.name || "Player", targetColor: ''});
+                broadcast({ type: 'lobby-update', players: players });
+                updateLobbyUI();
+            }
+            handleData(data, conn);
+        });
+    });
+}
+
+function joinGame() {
+    myName = document.getElementById('player-name').value.trim() || "Player";
+    const target = document.getElementById('join-id').value.toUpperCase();
+    if (target.length !== 3) return alert("Enter exactly 3 characters for Room Code!");
+    
+    peer = new Peer(); 
+    
+    peer.on('open', () => {
+        isHost = false;
+        hostConn = peer.connect(ID_PREFIX + target);
+        
+        hostConn.on('open', () => {
+            hostConn.send({ type: 'hello', name: myName });
+            document.getElementById('lobby-init').style.display = 'none';
+            document.getElementById('lobby-wait').style.display = 'block';
+            document.getElementById('room-code-label').innerText = target;
+        });
+
+        hostConn.on('data', data => handleData(data, hostConn));
+    });
+}
+
+function handleData(data, sender) {
+    if (data.type === 'lobby-update') {
+        players = data.players;
+        updateLobbyUI();
+    }
+    if (data.type === 'start-game') startGame();
+    
+    if (data.type === 'move-striker' && isHost) {
+        if (players[turnIndex].id === sender.peer && !shotFired) {
+            striker.pos.x = data.x;
+        }
+    }
+    
+    if (data.type === 'shot' && isHost) {
+        if (players[turnIndex].id === sender.peer && !shotFired) {
+            striker.vel = new Vec(data.vel.x, data.vel.y);
+            shotFired = true;
+        }
+    }
+    
+    if (data.type === 'sync-state' && !isHost) {
+        turnIndex = data.turnIndex;
+        players = data.players;
+        shotFired = data.shotFired;
+        queenState = data.queenState;
+        
+        data.pieces.forEach((p, i) => {
+            if (!pieces[i]) return;
+            pieces[i].pos = new Vec(p.x, p.y);
+            pieces[i].removed = p.removed;
+            pieces[i].isSinking = p.isSinking;
+            pieces[i].scale = p.scale;
+            pieces[i].type = p.type;
+        });
+
+        const isMyTurn = players[turnIndex].id === peer.id;
+        // Host enforces visual state. If it's not my turn OR a shot is fired, update local slider
+        if (!isMyTurn || shotFired) {
+            striker.pos.x = data.striker.x;
+            strikerSlider.value = data.striker.x;
+        }
+        
+        striker.pos.y = data.striker.y;
+        striker.vel = new Vec(data.striker.vx, data.striker.vy);
+        striker.removed = data.striker.removed;
+        striker.scale = data.striker.scale;
+    }
+    
+    if (data.type === 'game-over') {
+        gameOverMsg = data.winner + " WINS!";
+    }
+}
+
+function broadcast(data) {
+    connections.forEach(c => c.send(data));
+}
+
+function updateLobbyUI() {
+    const list = document.getElementById('p-list-items');
+    list.innerHTML = "";
+    players.forEach(p => {
+        const li = document.createElement('li');
+        li.innerText = p.name + (p.id === peer.id ? " (You)" : "");
+        list.appendChild(li);
+    });
+}
+
+function hostStartGame() {
+    // Assign Colors & Shuffle Turn
+    players.forEach((p, i) => { p.targetColor = PIECE_COLORS[i % PIECE_COLORS.length]; });
+    turnIndex = Math.floor(Math.random() * players.length); // Coin Toss for breaking
+    
+    broadcast({ type: 'start-game', players, turnIndex });
+    startGame();
+}
+
+function startGame() {
+    gameStarted = true;
+    document.getElementById('lobby').style.display = 'none';
+    document.getElementById('game-wrapper').style.display = 'flex';
+    initBoard();
+    gameLoop();
+}
+
+/** --- BOARD SETUP --- **/
+function initBoard() {
+    pieces = [];
+    const cx = 400, cy = 400;
+    pieces.push(new Piece(cx, cy, PIECE_RAD, 'queen'));
+    
+    // Total Regular Pieces = 9 per player. Alternate colors in rings.
+    let sequence = [];
+    for(let j=0; j<9; j++) {
+        for(let i=0; i<players.length; i++) sequence.push(players[i].targetColor);
+    }
+    
+    let ringSizes = [6, 12, 18, 24, 30];
+    let rIdx = 0, pIdx = 0, radius = 38;
+    
+    while(pIdx < sequence.length) {
+        let limit = Math.min(ringSizes[rIdx], sequence.length - pIdx);
+        for(let i=0; i<limit; i++) {
+            let a = (i * (360/limit)) * Math.PI/180;
+            pieces.push(new Piece(cx + Math.cos(a)*radius, cy + Math.sin(a)*radius, PIECE_RAD, sequence[pIdx]));
+            pIdx++;
+        }
+        rIdx++;
+        radius += 38;
+    }
+    
+    striker = new Piece(400, 680, STRIKER_RAD, 'striker');
+}
+
+/** --- CORE ENGINE & RULES --- **/
+function resolveCollisions() {
+    let all = [striker, ...pieces].filter(p => !p.removed && !p.isSinking);
+    for (let i = 0; i < all.length; i++) {
+        for (let j = i + 1; j < all.length; j++) {
+            let p1 = all[i], p2 = all[j];
+            let d = p1.pos.dist(p2.pos);
+            if (d < p1.radius + p2.radius) {
+                let overlap = p1.radius + p2.radius - d;
+                let dir = p1.pos.sub(p2.pos).normalize();
+                p1.pos = p1.pos.add(dir.mult(overlap/2));
+                p2.pos = p2.pos.sub(dir.mult(overlap/2));
+
+                let vDiff = p1.vel.sub(p2.vel);
+                let dot = vDiff.x * dir.x + vDiff.y * dir.y;
+                if (dot < 0) {
+                    let force = dir.mult(dot * 0.9);
+                    p1.vel = p1.vel.sub(force);
+                    p2.vel = p2.vel.add(force);
+                }
+            }
+        }
+    }
+}
+
+function checkPockets() {
+    const holes = [
+        new Vec(PADDING, PADDING), new Vec(BOARD_SIZE-PADDING, PADDING),
+        new Vec(PADDING, BOARD_SIZE-PADDING), new Vec(BOARD_SIZE-PADDING, BOARD_SIZE-PADDING)
+    ];
+
+    [striker, ...pieces].forEach(p => {
+        if (p.removed || p.isSinking) return;
+        holes.forEach(h => {
+            if (p.pos.dist(h) < POCKET_RADIUS) {
+                p.isSinking = true;
+                if (isHost) {
+                    if (p.type === 'striker') currentShotStats.foul = true;
+                    else if (p.type === 'queen') currentShotStats.queenSunk = true;
+                    else if (p.type === players[turnIndex].targetColor) currentShotStats.ownPieceSunk = true;
+                }
+            }
+        });
+    });
+}
+
+function respawnPiece(type) {
+    let p = pieces.find(p => p.type === type && (p.removed || p.isSinking));
+    if (p) {
+        p.removed = false; p.isSinking = false;
+        p.scale = 1.0; p.vel = new Vec(0,0);
+        p.pos = new Vec(400, 400); // Center
+    }
+}
+
+function evaluateShotRules() {
+    let nextTurn = turnIndex;
+    let myColor = players[turnIndex].targetColor;
+
+    // Check premature win foul (Sinking last piece while Queen is on board)
+    let myPiecesLeft = pieces.filter(p => p.type === myColor && !p.removed && !p.isSinking).length;
+    if (myPiecesLeft === 0 && queenState === 'board') {
+        currentShotStats.foul = true; // Illegal to sink last piece before Queen is handled
+    }
+
+    if (currentShotStats.foul) {
+        respawnPiece(myColor); // Penalty
+        if (queenState === 'uncovered' && queenSinker === turnIndex) {
+            respawnPiece('queen');
+            queenState = 'board';
+        }
+        nextTurn = (turnIndex + 1) % players.length;
+    } else {
+        if (queenState === 'uncovered' && queenSinker === turnIndex) {
+            if (currentShotStats.ownPieceSunk) {
+                queenState = 'covered';
+                nextTurn = turnIndex; // Covered successfully, gets another shot
+            } else {
+                respawnPiece('queen');
+                queenState = 'board';
+                nextTurn = (turnIndex + 1) % players.length;
+            }
+        } else {
+            if (currentShotStats.queenSunk) {
+                queenState = 'uncovered';
+                queenSinker = turnIndex;
+                nextTurn = turnIndex; // Gets chance to cover
+            } else if (currentShotStats.ownPieceSunk) {
+                nextTurn = turnIndex; // Continues Turn
+            } else {
+                nextTurn = (turnIndex + 1) % players.length;
+            }
+        }
+    }
+
+    // Win Check
+    myPiecesLeft = pieces.filter(p => p.type === myColor && !p.removed && !p.isSinking).length;
+    let queenIsGone = !pieces.some(p => p.type === 'queen' && !p.removed && !p.isSinking);
+    if (myPiecesLeft === 0 && (queenState === 'covered' || queenIsGone)) {
+        gameOverMsg = players[turnIndex].name + " WINS!";
+        broadcast({ type: 'game-over', winner: players[turnIndex].name });
+    }
+
+    // Reset
+    currentShotStats = { foul: false, ownPieceSunk: false, queenSunk: false };
+    turnIndex = nextTurn;
+    resetStriker();
+    shotFired = false;
+}
+
+function gameLoop() {
+    ctx.clearRect(0, 0, BOARD_SIZE, BOARD_SIZE);
+    
+    if (isHost && !gameOverMsg) {
+        resolveCollisions();
+        checkPockets();
+    }
+    
+    [striker, ...pieces].forEach(p => p.update());
+
+    // When board completely stops moving
+    let moving = [striker, ...pieces].some(p => p.vel.mag() > 0.1 || (p.isSinking && !p.removed));
+    
+    if (isHost && shotFired && !moving && !gameOverMsg) {
+        evaluateShotRules();
+    }
+
+    if (isHost) {
+        broadcast({
+            type: 'sync-state', turnIndex, shotFired, players, queenState,
+            striker: {x: striker.pos.x, y: striker.pos.y, vx: striker.vel.x, vy: striker.vel.y, removed: striker.removed, scale: striker.scale},
+            pieces: pieces.map(p => ({x: p.pos.x, y: p.pos.y, removed: p.removed, isSinking: p.isSinking, scale: p.scale, type: p.type}))
+        });
+    }
+
+    drawBoard();
+    updateUI();
+    requestAnimationFrame(gameLoop);
+}
+
+function resetStriker() {
+    striker.removed = false;
+    striker.isSinking = false;
+    striker.scale = 1.0;
+    striker.vel = new Vec(0,0);
+    striker.pos = new Vec(400, 680); 
+    strikerSlider.value = 400; 
+}
+
+function drawBoard() {
+    // Board Lines & Pockets
+    ctx.strokeStyle = "#3d2b1f"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(400,400, 85, 0, Math.PI*2); ctx.stroke(); // Center ring
+    ctx.fillStyle = "#111";
+    [PADDING, BOARD_SIZE-PADDING].forEach(x => {
+        [PADDING, BOARD_SIZE-PADDING].forEach(y => {
+            ctx.beginPath(); ctx.arc(x, y, POCKET_RADIUS, 0, Math.PI*2); ctx.fill();
+        });
+    });
+    
+    // Baselines (Double Lines)
+    [105, 670].forEach(y => {
+        ctx.strokeRect(160, y, 480, 25);
+        ctx.beginPath(); ctx.arc(160, y+12.5, 12.5, 0, Math.PI*2); ctx.stroke();
+        ctx.beginPath(); ctx.arc(640, y+12.5, 12.5, 0, Math.PI*2); ctx.stroke();
+    });
+
+    pieces.forEach(p => p.draw(ctx));
+    striker.draw(ctx);
+
+    if (isDragging && !gameOverMsg) {
+        let diff = striker.pos.sub(dragEnd);
+        let dist = Math.min(diff.mag(), 200);
+        ctx.beginPath();
+        ctx.moveTo(striker.pos.x, striker.pos.y);
+        ctx.lineTo(striker.pos.x + diff.x, striker.pos.y + diff.y);
+        ctx.strokeStyle = `rgba(243, 156, 18, ${dist/200})`;
+        ctx.setLineDash([5, 5]); ctx.lineWidth = 3; ctx.stroke(); 
+        ctx.setLineDash([]); ctx.lineWidth = 2;
+    }
+
+    if (gameOverMsg) {
+        ctx.fillStyle = "rgba(0,0,0,0.8)";
+        ctx.fillRect(0, 0, BOARD_SIZE, BOARD_SIZE);
+        ctx.fillStyle = "#f1c40f"; ctx.font = "bold 60px Segoe UI"; 
+        ctx.textAlign = "center"; ctx.fillText(gameOverMsg, 400, 400);
+    }
+}
+
+function updateUI() {
+    if (!players.length) return;
+
+    const container = document.getElementById('scoreboard-container');
+    container.innerHTML = "";
+    players.forEach((p, i) => {
+        const row = document.createElement('div');
+        row.className = 'score-row' + (turnIndex === i ? ' active' : '');
+        let count = pieces.filter(pc => pc.type === p.targetColor && !pc.removed).length;
+        let cHex = new Piece(0,0,0, p.targetColor).colors[p.targetColor].main;
+        
+        row.innerHTML = `
+            <div style="display:flex; align-items:center;">
+                <div class="swatch" style="background:${cHex}"></div>
+                <span>${p.name}</span>
+            </div>
+            <span>Left: ${count}</span>`;
+        container.appendChild(row);
+    });
+
+    const isMyTurn = players[turnIndex].id === peer.id;
+    strikerSlider.disabled = (!isMyTurn || shotFired);
+    
+    const status = document.getElementById('turn-status');
+    if (gameOverMsg) {
+        status.innerText = "Game Over"; status.style.background = "#555";
+    } else if (shotFired) {
+        status.innerText = "Simulating..."; status.style.background = "#8e44ad";
+    } else {
+        status.innerText = isMyTurn ? "Your Turn!" : `${players[turnIndex].name}'s Turn`;
+        status.style.background = isMyTurn ? "#27ae60" : "#c0392b";
+    }
+
+    const qStatus = document.getElementById('queen-status');
+    if (queenState === 'board') { qStatus.innerText = "Queen: On Board"; qStatus.style.borderColor = "#e74c3c"; }
+    else if (queenState === 'uncovered') { qStatus.innerText = "Queen: Needs Cover!"; qStatus.style.borderColor = "#f1c40f"; }
+    else if (queenState === 'covered') { qStatus.innerText = "Queen: Covered"; qStatus.style.borderColor = "#2ecc71"; }
+}
+
+/** --- INPUTS --- **/
+strikerSlider.addEventListener('input', e => {
+    if (!peer || players.length === 0 || gameOverMsg) return;
+    if (players[turnIndex].id !== peer.id || shotFired) return;
+    
+    let x = parseInt(e.target.value);
+    striker.pos.x = x; 
+    
+    if (!isHost) {
+        hostConn.send({ type: 'move-striker', x: x });
+    }
+});
+
+canvas.addEventListener('mousedown', e => {
+    if (!peer || players.length === 0 || gameOverMsg) return;
+    if (players[turnIndex].id !== peer.id || shotFired || striker.vel.mag() > 0.1) return;
+    isDragging = true;
+});
+
+window.addEventListener('mousemove', e => {
+    if (!isDragging) return;
+    const rect = canvas.getBoundingClientRect();
+    dragEnd = new Vec(e.clientX - rect.left, e.clientY - rect.top);
+});
+
+window.addEventListener('mouseup', e => {
+    if (!isDragging) return;
+    isDragging = false;
+    
+    let diff = striker.pos.sub(dragEnd);
+    let powerScale = document.getElementById('power-sens').value;
+    let vel = diff.mult(0.08 * powerScale);
+    
+    if (vel.mag() > 40) vel = vel.normalize().mult(40);
+
+    if (isHost) {
+        striker.vel = vel;
+        shotFired = true;
+    } else {
+        hostConn.send({ type: 'shot', vel: {x: vel.x, y: vel.y} });
+    }
+});
+
+</script>
+</body>
+</html>
