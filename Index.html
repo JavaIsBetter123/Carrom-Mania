@@ -181,6 +181,8 @@ class Piece {
     draw(ctx) {
         if (this.removed) return;
         const c = this.colors[this.type];
+        if(!c) return; // Failsafe against desyncs
+
         ctx.save();
         ctx.translate(this.pos.x, this.pos.y);
         ctx.scale(this.scale, this.scale);
@@ -330,7 +332,13 @@ function handleData(data, sender) {
         players = data.players;
         updateLobbyUI();
     }
-    if (data.type === 'start-game') startGame();
+    
+    // Crucial Client Fix: Setup players data BEFORE starting to draw the board!
+    if (data.type === 'start-game') {
+        players = data.players;
+        turnIndex = data.turnIndex;
+        startGame();
+    }
     
     if (data.type === 'move-striker' && isHost) {
         if (players[turnIndex].id === sender.peer && !shotFired) {
@@ -346,13 +354,18 @@ function handleData(data, sender) {
     }
     
     if (data.type === 'sync-state' && !isHost) {
+        let turnChanged = (turnIndex !== data.turnIndex);
+        
         turnIndex = data.turnIndex;
         players = data.players;
         shotFired = data.shotFired;
         queenState = data.queenState;
         
+        // Auto-rebuild pieces dynamically for clients to prevent blank screens/errors
         data.pieces.forEach((p, i) => {
-            if (!pieces[i]) return;
+            if (!pieces[i]) {
+                pieces[i] = new Piece(p.x, p.y, PIECE_RAD, p.type);
+            }
             pieces[i].pos = new Vec(p.x, p.y);
             pieces[i].removed = p.removed;
             pieces[i].isSinking = p.isSinking;
@@ -361,8 +374,11 @@ function handleData(data, sender) {
         });
 
         const isMyTurn = players[turnIndex].id === peer.id;
-        // Host enforces visual state. If it's not my turn OR a shot is fired, update local slider
-        if (!isMyTurn || shotFired) {
+        
+        // Host enforces visual state. 
+        // Only ignore if it's currently YOUR turn and you haven't shot yet.
+        // Update immediately if the turn just changed to fix stuck sliders.
+        if (!isMyTurn || shotFired || turnChanged) {
             striker.pos.x = data.striker.x;
             strikerSlider.value = data.striker.x;
         }
@@ -636,7 +652,10 @@ function updateUI() {
         const row = document.createElement('div');
         row.className = 'score-row' + (turnIndex === i ? ' active' : '');
         let count = pieces.filter(pc => pc.type === p.targetColor && !pc.removed).length;
-        let cHex = new Piece(0,0,0, p.targetColor).colors[p.targetColor].main;
+        
+        // Failsafe for getting colors
+        let pColors = new Piece(0,0,0, p.targetColor).colors;
+        let cHex = pColors[p.targetColor] ? pColors[p.targetColor].main : '#888';
         
         row.innerHTML = `
             <div style="display:flex; align-items:center;">
