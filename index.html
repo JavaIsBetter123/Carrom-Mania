@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pro P2P Carrom - Multi-Player</title>
+    <title>Carrom Mania - Multi-Player</title>
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
     <style>
         :root {
@@ -25,6 +25,7 @@
             padding: 30px; border-radius: 12px;
             box-shadow: 0 10px 30px rgba(0,0,0,0.5); min-width: 320px;
         }
+        h1 { color: var(--accent); margin-top: 0; font-size: 2.2rem; text-transform: uppercase; letter-spacing: 2px;}
         input[type="text"] { 
             padding: 12px; border-radius: 6px; border: none; margin: 10px 0; 
             background: #444; color: white; width: calc(100% - 24px); 
@@ -87,7 +88,7 @@
 
     <!-- LOBBY -->
     <div id="lobby">
-        <h1>CARROM P2P</h1>
+        <h1>CARROM MANIA</h1>
         
         <div id="lobby-init">
             <input type="text" id="player-name" placeholder="ENTER YOUR NAME" maxlength="15">
@@ -138,7 +139,7 @@
 
 <script>
 /** --- CONSTANTS & MATH --- **/
-const ID_PREFIX = "CARROM4-";
+const ID_PREFIX = "CMANIA-"; // Unique prefix
 const BOARD_SIZE = 800;
 const PADDING = 45;
 const FRICTION = 0.985;
@@ -147,6 +148,17 @@ const PIECE_RAD = 18;
 const STRIKER_RAD = 24;
 
 const PIECE_COLORS = ['white', 'black', 'blue', 'green']; 
+
+// ICE Servers to bypass firewalls and let players on different networks join
+const peerConfig = {
+    config: {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:global.stun.twilio.com:3478' }
+        ]
+    }
+};
 
 class Vec {
     constructor(x, y) { this.x = x; this.y = y; }
@@ -187,13 +199,11 @@ class Piece {
         ctx.translate(this.pos.x, this.pos.y);
         ctx.scale(this.scale, this.scale);
         
-        // Shadow
         ctx.beginPath();
         ctx.arc(3, 3, this.radius, 0, Math.PI*2);
         ctx.fillStyle = "rgba(0,0,0,0.3)";
         ctx.fill();
         
-        // Body
         let grad = ctx.createRadialGradient(-this.radius/3, -this.radius/3, 2, 0, 0, this.radius);
         grad.addColorStop(0, c.main); grad.addColorStop(1, c.detail);
         
@@ -202,7 +212,6 @@ class Piece {
         ctx.fillStyle = grad; ctx.fill();
         ctx.strokeStyle = "rgba(0,0,0,0.5)"; ctx.lineWidth = 2; ctx.stroke();
         
-        // Center ring design
         if(this.type !== 'striker') {
             ctx.beginPath();
             ctx.arc(0, 0, this.radius * 0.5, 0, Math.PI*2);
@@ -260,9 +269,10 @@ let dragEnd = new Vec(0,0);
 let gameStarted = false;
 let shotFired = false;
 let gameOverMsg = "";
+let needsSync = true; // Prevents network flooding
 
 // Game Rules State
-let queenState = 'board'; // 'board', 'uncovered', 'covered'
+let queenState = 'board';
 let queenSinker = -1;
 let currentShotStats = { foul: false, ownPieceSunk: false, queenSunk: false };
 
@@ -274,10 +284,21 @@ function generateShortID() {
 }
 
 /** --- NETWORKING --- **/
+function handlePeerErrors(p) {
+    p.on('error', err => {
+        console.error(err);
+        alert("Network Error: " + err.message + "\n\nMake sure the room code is correct.");
+        document.getElementById('lobby-wait').style.display = 'none';
+        document.getElementById('lobby-init').style.display = 'block';
+    });
+}
+
 function hostGame() {
     myName = document.getElementById('player-name').value.trim() || "Host";
     myIdShort = generateShortID();
-    peer = new Peer(ID_PREFIX + myIdShort);
+    
+    peer = new Peer(ID_PREFIX + myIdShort, peerConfig);
+    handlePeerErrors(peer);
 
     peer.on('open', id => {
         isHost = true;
@@ -310,7 +331,8 @@ function joinGame() {
     const target = document.getElementById('join-id').value.toUpperCase();
     if (target.length !== 3) return alert("Enter exactly 3 characters for Room Code!");
     
-    peer = new Peer(); 
+    peer = new Peer(peerConfig); 
+    handlePeerErrors(peer);
     
     peer.on('open', () => {
         isHost = false;
@@ -333,7 +355,6 @@ function handleData(data, sender) {
         updateLobbyUI();
     }
     
-    // Crucial Client Fix: Setup players data BEFORE starting to draw the board!
     if (data.type === 'start-game') {
         players = data.players;
         turnIndex = data.turnIndex;
@@ -343,6 +364,7 @@ function handleData(data, sender) {
     if (data.type === 'move-striker' && isHost) {
         if (players[turnIndex].id === sender.peer && !shotFired) {
             striker.pos.x = data.x;
+            needsSync = true;
         }
     }
     
@@ -350,6 +372,7 @@ function handleData(data, sender) {
         if (players[turnIndex].id === sender.peer && !shotFired) {
             striker.vel = new Vec(data.vel.x, data.vel.y);
             shotFired = true;
+            needsSync = true;
         }
     }
     
@@ -361,11 +384,8 @@ function handleData(data, sender) {
         shotFired = data.shotFired;
         queenState = data.queenState;
         
-        // Auto-rebuild pieces dynamically for clients to prevent blank screens/errors
         data.pieces.forEach((p, i) => {
-            if (!pieces[i]) {
-                pieces[i] = new Piece(p.x, p.y, PIECE_RAD, p.type);
-            }
+            if (!pieces[i]) pieces[i] = new Piece(p.x, p.y, PIECE_RAD, p.type);
             pieces[i].pos = new Vec(p.x, p.y);
             pieces[i].removed = p.removed;
             pieces[i].isSinking = p.isSinking;
@@ -375,9 +395,6 @@ function handleData(data, sender) {
 
         const isMyTurn = players[turnIndex].id === peer.id;
         
-        // Host enforces visual state. 
-        // Only ignore if it's currently YOUR turn and you haven't shot yet.
-        // Update immediately if the turn just changed to fix stuck sliders.
         if (!isMyTurn || shotFired || turnChanged) {
             striker.pos.x = data.striker.x;
             strikerSlider.value = data.striker.x;
@@ -409,9 +426,8 @@ function updateLobbyUI() {
 }
 
 function hostStartGame() {
-    // Assign Colors & Shuffle Turn
     players.forEach((p, i) => { p.targetColor = PIECE_COLORS[i % PIECE_COLORS.length]; });
-    turnIndex = Math.floor(Math.random() * players.length); // Coin Toss for breaking
+    turnIndex = Math.floor(Math.random() * players.length);
     
     broadcast({ type: 'start-game', players, turnIndex });
     startGame();
@@ -431,7 +447,6 @@ function initBoard() {
     const cx = 400, cy = 400;
     pieces.push(new Piece(cx, cy, PIECE_RAD, 'queen'));
     
-    // Total Regular Pieces = 9 per player. Alternate colors in rings.
     let sequence = [];
     for(let j=0; j<9; j++) {
         for(let i=0; i<players.length; i++) sequence.push(players[i].targetColor);
@@ -505,7 +520,7 @@ function respawnPiece(type) {
     if (p) {
         p.removed = false; p.isSinking = false;
         p.scale = 1.0; p.vel = new Vec(0,0);
-        p.pos = new Vec(400, 400); // Center
+        p.pos = new Vec(400, 400); 
     }
 }
 
@@ -513,14 +528,13 @@ function evaluateShotRules() {
     let nextTurn = turnIndex;
     let myColor = players[turnIndex].targetColor;
 
-    // Check premature win foul (Sinking last piece while Queen is on board)
     let myPiecesLeft = pieces.filter(p => p.type === myColor && !p.removed && !p.isSinking).length;
     if (myPiecesLeft === 0 && queenState === 'board') {
-        currentShotStats.foul = true; // Illegal to sink last piece before Queen is handled
+        currentShotStats.foul = true; 
     }
 
     if (currentShotStats.foul) {
-        respawnPiece(myColor); // Penalty
+        respawnPiece(myColor); 
         if (queenState === 'uncovered' && queenSinker === turnIndex) {
             respawnPiece('queen');
             queenState = 'board';
@@ -530,7 +544,7 @@ function evaluateShotRules() {
         if (queenState === 'uncovered' && queenSinker === turnIndex) {
             if (currentShotStats.ownPieceSunk) {
                 queenState = 'covered';
-                nextTurn = turnIndex; // Covered successfully, gets another shot
+                nextTurn = turnIndex; 
             } else {
                 respawnPiece('queen');
                 queenState = 'board';
@@ -540,16 +554,15 @@ function evaluateShotRules() {
             if (currentShotStats.queenSunk) {
                 queenState = 'uncovered';
                 queenSinker = turnIndex;
-                nextTurn = turnIndex; // Gets chance to cover
+                nextTurn = turnIndex; 
             } else if (currentShotStats.ownPieceSunk) {
-                nextTurn = turnIndex; // Continues Turn
+                nextTurn = turnIndex; 
             } else {
                 nextTurn = (turnIndex + 1) % players.length;
             }
         }
     }
 
-    // Win Check
     myPiecesLeft = pieces.filter(p => p.type === myColor && !p.removed && !p.isSinking).length;
     let queenIsGone = !pieces.some(p => p.type === 'queen' && !p.removed && !p.isSinking);
     if (myPiecesLeft === 0 && (queenState === 'covered' || queenIsGone)) {
@@ -557,11 +570,11 @@ function evaluateShotRules() {
         broadcast({ type: 'game-over', winner: players[turnIndex].name });
     }
 
-    // Reset
     currentShotStats = { foul: false, ownPieceSunk: false, queenSunk: false };
     turnIndex = nextTurn;
     resetStriker();
     shotFired = false;
+    needsSync = true;
 }
 
 function gameLoop() {
@@ -574,19 +587,26 @@ function gameLoop() {
     
     [striker, ...pieces].forEach(p => p.update());
 
-    // When board completely stops moving
     let moving = [striker, ...pieces].some(p => p.vel.mag() > 0.1 || (p.isSinking && !p.removed));
+    
+    if (moving || shotFired) {
+        needsSync = true; 
+    }
     
     if (isHost && shotFired && !moving && !gameOverMsg) {
         evaluateShotRules();
     }
 
-    if (isHost) {
+    // Network Optimization: Only broadcast if something changed or is moving
+    if (isHost && needsSync) {
         broadcast({
             type: 'sync-state', turnIndex, shotFired, players, queenState,
             striker: {x: striker.pos.x, y: striker.pos.y, vx: striker.vel.x, vy: striker.vel.y, removed: striker.removed, scale: striker.scale},
             pieces: pieces.map(p => ({x: p.pos.x, y: p.pos.y, removed: p.removed, isSinking: p.isSinking, scale: p.scale, type: p.type}))
         });
+        if (!moving && !shotFired) {
+            needsSync = false; // Stopped moving, stop flooding the network!
+        }
     }
 
     drawBoard();
@@ -604,9 +624,8 @@ function resetStriker() {
 }
 
 function drawBoard() {
-    // Board Lines & Pockets
     ctx.strokeStyle = "#3d2b1f"; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(400,400, 85, 0, Math.PI*2); ctx.stroke(); // Center ring
+    ctx.beginPath(); ctx.arc(400,400, 85, 0, Math.PI*2); ctx.stroke(); 
     ctx.fillStyle = "#111";
     [PADDING, BOARD_SIZE-PADDING].forEach(x => {
         [PADDING, BOARD_SIZE-PADDING].forEach(y => {
@@ -614,7 +633,6 @@ function drawBoard() {
         });
     });
     
-    // Baselines (Double Lines)
     [105, 670].forEach(y => {
         ctx.strokeRect(160, y, 480, 25);
         ctx.beginPath(); ctx.arc(160, y+12.5, 12.5, 0, Math.PI*2); ctx.stroke();
@@ -653,7 +671,6 @@ function updateUI() {
         row.className = 'score-row' + (turnIndex === i ? ' active' : '');
         let count = pieces.filter(pc => pc.type === p.targetColor && !pc.removed).length;
         
-        // Failsafe for getting colors
         let pColors = new Piece(0,0,0, p.targetColor).colors;
         let cHex = pColors[p.targetColor] ? pColors[p.targetColor].main : '#888';
         
@@ -693,7 +710,9 @@ strikerSlider.addEventListener('input', e => {
     let x = parseInt(e.target.value);
     striker.pos.x = x; 
     
-    if (!isHost) {
+    if (isHost) {
+        needsSync = true;
+    } else {
         hostConn.send({ type: 'move-striker', x: x });
     }
 });
@@ -723,6 +742,7 @@ window.addEventListener('mouseup', e => {
     if (isHost) {
         striker.vel = vel;
         shotFired = true;
+        needsSync = true;
     } else {
         hostConn.send({ type: 'shot', vel: {x: vel.x, y: vel.y} });
     }
